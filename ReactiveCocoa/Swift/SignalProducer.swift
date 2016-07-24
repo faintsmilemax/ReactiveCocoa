@@ -1628,8 +1628,6 @@ extension SignalProducerProtocol {
 	/// This operator is only recommended when you absolutely need to introduce
 	/// a layer of caching in front of another `SignalProducer`.
 	///
-	/// - note: This operator has the same semantics as `SignalProducer.buffer`.
-	///
 	/// - precondtion: `capacity` must be non-negative integer.
 	///
 	/// - parameters:
