@@ -1640,11 +1640,7 @@ extension SignalProducerProtocol {
 	public func replayLazily(upTo capacity: Int) -> SignalProducer<Value, Error> {
 		precondition(capacity >= 0, "Invalid capacity: \(capacity)")
 
-		var producer: SignalProducer<Value, Error>?
-		var producerObserver: SignalProducer<Value, Error>.ProducedSignal.Observer?
-
-		let lock = Lock()
-		lock.name = "org.reactivecocoa.ReactiveCocoa.SignalProducer.replayLazily"
+		let state = Atomic<ReplayState<Value, Error>?>(nil)
 
 		// This will go "out of scope" when the returned `SignalProducer` goes
 		// out of scope. This lets us know when we're supposed to dispose the
@@ -1653,35 +1649,28 @@ extension SignalProducerProtocol {
 		let token = DeallocationToken()
 
 		return SignalProducer { observer, disposable in
-			var token: DeallocationToken? = token
-			let initializedProducer: SignalProducer<Value, Error>
-			let initializedObserver: SignalProducer<Value, Error>.ProducedSignal.Observer
-			let shouldStartUnderlyingProducer: Bool
+			var currentState: ReplayState<Value, Error>!
+			var shouldStartUnderlyingProducer = false
 
-			lock.lock()
-			if let producer = producer, producerObserver = producerObserver {
-				(initializedProducer, initializedObserver) = (producer, producerObserver)
-				shouldStartUnderlyingProducer = false
-			} else {
-				let (producerTemp, observerTemp) = SignalProducer<Value, Error>.bufferingProducer(upTo: capacity)
-
-				(producer, producerObserver) = (producerTemp, observerTemp)
-				(initializedProducer, initializedObserver) = (producerTemp, observerTemp)
-				shouldStartUnderlyingProducer = true
+			state.modify { state in
+				if state == nil {
+					state = ReplayState(upTo: capacity)
+					shouldStartUnderlyingProducer = true
+				}
+				currentState = state
 			}
-			lock.unlock()
 
 			// subscribe `observer` before starting the underlying producer.
-			disposable += initializedProducer.start(observer)
+			disposable += currentState.producer.start(observer)
 			disposable += {
 				// Don't dispose of the original producer until all observers
 				// have terminated.
-				token = nil
+				_ = token
 			}
 
 			if shouldStartUnderlyingProducer {
-				self.take(until: token!.deallocSignal)
-					.start(initializedObserver)
+				self.take(until: token.deallocSignal)
+					.start(currentState.observer)
 			}
 		}
 	}
@@ -1695,26 +1684,27 @@ private final class DeallocationToken {
 	}
 }
 
-extension SignalProducer {
-	private static func bufferingProducer(upTo capacity: Int) -> (SignalProducer, Signal<Value, Error>.Observer) {
-		precondition(capacity >= 0, "Invalid capacity: \(capacity)")
+private struct ReplayState<Value, Error: ErrorProtocol> {
+	let producer: SignalProducer<Value, Error>
+	let observer: SignalProducer<Value, Error>.ProducedSignal.Observer
 
+	init(upTo capacity: Int) {
 		// Used as an atomic variable so we can remove observers without needing
 		// to run on a serial queue.
-		let state: Atomic<BufferState<Value, Error>> = Atomic(BufferState())
+		let state: Atomic<BufferState<Value, Error>> = Atomic(BufferState(upTo: capacity))
 
-		let producer = self.init { observer, disposable in
-			// Assigned to when replay() is invoked synchronously below.
+		producer = SignalProducer { observer, disposable in
 			var token: RemovalToken?
 
 			let replayBuffer = ReplayBuffer<Value>()
 			var replayValues: [Value] = []
 			var replayToken: RemovalToken?
+
 			var next = state.modify { state in
-				replayValues = state.values
-				if replayValues.isEmpty {
+				if state.values.isEmpty {
 					token = state.observers?.insert(observer)
 				} else {
+					replayValues = state.values
 					replayToken = state.replayBuffers.insert(replayBuffer)
 				}
 			}
@@ -1747,10 +1737,10 @@ extension SignalProducer {
 			}
 		}
 
-		let bufferingObserver: Signal<Value, Error>.Observer = Observer { event in
+		observer = Observer { event in
 			let originalState = state.modify { state in
 				if let value = event.value {
-					state.add(value, upTo: capacity)
+					state.add(value)
 				} else {
 					// Disconnect all observers and prevent future
 					// attachments.
@@ -1761,8 +1751,6 @@ extension SignalProducer {
 
 			originalState.observers?.forEach { $0.action(event) }
 		}
-
-		return (producer, bufferingObserver)
 	}
 }
 
@@ -1773,6 +1761,9 @@ private final class ReplayBuffer<Value> {
 }
 
 private struct BufferState<Value, Error: ErrorProtocol> {
+	/// The capacity of this `BufferState`.
+	let capacity: Int
+
 	/// All values in the buffer.
 	var values: [Value] = []
 
@@ -1788,9 +1779,13 @@ private struct BufferState<Value, Error: ErrorProtocol> {
 	/// The set of unused replay token identifiers.
 	var replayBuffers: Bag<ReplayBuffer<Value>> = Bag()
 
+	init(upTo capacity: Int) {
+		self.capacity = capacity
+	}
+
 	/// Appends a new value to the buffer, trimming it down to the given capacity
 	/// if necessary.
-	mutating func add(_ value: Value, upTo capacity: Int) {
+	mutating func add(_ value: Value) {
 		precondition(capacity >= 0)
 
 		for buffer in replayBuffers {
