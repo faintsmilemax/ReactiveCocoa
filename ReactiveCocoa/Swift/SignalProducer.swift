@@ -1784,8 +1784,6 @@ private struct BufferState<Value, Error: ErrorProtocol> {
 	/// Appends a new value to the buffer, trimming it down to the given capacity
 	/// if necessary.
 	mutating func add(_ value: Value) {
-		precondition(capacity >= 0)
-
 		for buffer in replayBuffers {
 			buffer.values.append(value)
 		}
