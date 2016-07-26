@@ -1717,7 +1717,7 @@ extension SignalProducerProtocol {
 			// have terminated.
 			disposable += { _ = token }
 
-			// Start the underlying producer if it hasn't been started.
+			// Start the underlying producer if it has never been started.
 			bootstrap.dispose()
 		}
 	}
@@ -1731,26 +1731,26 @@ private final class DeallocationToken {
 	}
 }
 
-/// A uniquely identifying token for Observers that are replaying values in
-/// BufferState.
+/// A uniquely identifying token for `Observer`s that are replaying values in
+/// `ReplayState`.
 private final class ReplayBuffer<Value> {
 	private var values: [Value] = []
 }
 
 private struct ReplayState<Value, Error: ErrorProtocol> {
-	/// The capacity of this `BufferState`.
+	/// The capacity of the caching producer.
 	let capacity: Int
 
-	/// All values in the buffer.
+	/// All cached values.
 	var values: [Value] = []
 
-	/// Any terminating event sent to the buffer.
+	/// A terminating event emitted by the underlying producer.
 	///
 	/// This will be nil if termination has not occurred.
 	var terminationEvent: Event<Value, Error>?
 
-	/// The observers currently attached to the buffered producer, or nil if the
-	/// producer was terminated.
+	/// The observers currently attached to the caching producer, or `nil` if the
+	/// caching producer was terminated.
 	var observers: Bag<Signal<Value, Error>.Observer>? = Bag()
 
 	/// The set of unused replay token identifiers.
@@ -1760,7 +1760,7 @@ private struct ReplayState<Value, Error: ErrorProtocol> {
 		self.capacity = capacity
 	}
 
-	/// Appends a new value to the buffer, trimming it down to the given capacity
+	/// Cache a new value, and trim down the cache to the given capacity
 	/// if necessary.
 	mutating func add(_ value: Value) {
 		for buffer in replayBuffers {
