@@ -1638,60 +1638,15 @@ extension SignalProducerProtocol {
 	public func replayLazily(upTo capacity: Int) -> SignalProducer<Value, Error> {
 		precondition(capacity >= 0, "Invalid capacity: \(capacity)")
 
-		let state = Atomic<ReplayState<Value, Error>?>(nil)
-
 		// This will go "out of scope" when the returned `SignalProducer` goes
 		// out of scope. This lets us know when we're supposed to dispose the
 		// underlying producer. This is necessary because `struct`s don't have
 		// `deinit`.
 		let token = DeallocationToken()
 
-		return SignalProducer { observer, disposable in
-			var currentState: ReplayState<Value, Error>!
-			var shouldStartUnderlyingProducer = false
+		let state: Atomic<ReplayState<Value, Error>> = Atomic(ReplayState(upTo: capacity))
 
-			state.modify { state in
-				if state == nil {
-					state = ReplayState(upTo: capacity)
-					shouldStartUnderlyingProducer = true
-				}
-				currentState = state
-			}
-
-			// subscribe `observer` before starting the underlying producer.
-			disposable += currentState.producer.start(observer)
-			disposable += {
-				// Don't dispose of the original producer until all observers
-				// have terminated.
-				_ = token
-			}
-
-			if shouldStartUnderlyingProducer {
-				self.take(until: token.deallocSignal)
-					.start(currentState.observer)
-			}
-		}
-	}
-}
-
-private final class DeallocationToken {
-	let (deallocSignal, observer) = Signal<(), NoError>.pipe()
-
-	deinit {
-		observer.sendCompleted()
-	}
-}
-
-private struct ReplayState<Value, Error: ErrorProtocol> {
-	let producer: SignalProducer<Value, Error>
-	let observer: SignalProducer<Value, Error>.ProducedSignal.Observer
-
-	init(upTo capacity: Int) {
-		// Used as an atomic variable so we can remove observers without needing
-		// to run on a serial queue.
-		let state: Atomic<BufferState<Value, Error>> = Atomic(BufferState(upTo: capacity))
-
-		producer = SignalProducer { observer, disposable in
+		let multicaster = SignalProducer<Value, Error> { observer, disposable in
 			var token: RemovalToken?
 
 			let replayBuffer = ReplayBuffer<Value>()
@@ -1735,20 +1690,44 @@ private struct ReplayState<Value, Error: ErrorProtocol> {
 			}
 		}
 
-		observer = Observer { event in
-			let originalState = state.modify { state in
-				if let value = event.value {
-					state.add(value)
-				} else {
-					// Disconnect all observers and prevent future
-					// attachments.
-					state.terminationEvent = event
-					state.observers = nil
-				}
-			}
+		let bootstrap = ActionDisposable {
+			// Start the underlying producer.
+			self.take(until: token.deallocSignal)
+				.start { event in
+					let originalState = state.modify { state in
+						if let value = event.value {
+							state.add(value)
+						} else {
+							// Disconnect all observers and prevent future
+							// attachments.
+							state.terminationEvent = event
+							state.observers = nil
+						}
+					}
 
-			originalState.observers?.forEach { $0.action(event) }
+					originalState.observers?.forEach { $0.action(event) }
+				}
 		}
+
+		return SignalProducer { observer, disposable in
+			// subscribe `observer` before starting the underlying producer.
+			disposable += multicaster.start(observer)
+
+			// Don't dispose of the original producer until all observers
+			// have terminated.
+			disposable += { _ = token }
+
+			// Start the underlying producer if it hasn't been started.
+			bootstrap.dispose()
+		}
+	}
+}
+
+private final class DeallocationToken {
+	let (deallocSignal, observer) = Signal<(), NoError>.pipe()
+
+	deinit {
+		observer.sendCompleted()
 	}
 }
 
@@ -1758,7 +1737,7 @@ private final class ReplayBuffer<Value> {
 	private var values: [Value] = []
 }
 
-private struct BufferState<Value, Error: ErrorProtocol> {
+private struct ReplayState<Value, Error: ErrorProtocol> {
 	/// The capacity of this `BufferState`.
 	let capacity: Int
 
