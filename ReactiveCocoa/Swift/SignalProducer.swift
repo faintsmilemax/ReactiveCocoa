@@ -1644,9 +1644,33 @@ extension SignalProducerProtocol {
 		// `deinit`.
 		let token = DeallocationToken()
 
+		// The state of the caching producer.
 		let state: Atomic<ReplayState<Value, Error>> = Atomic(ReplayState(upTo: capacity))
 
-		let multicaster = SignalProducer<Value, Error> { observer, disposable in
+		// The disposable which starts the underlying producer upon disposal.
+		let bootstrap = ActionDisposable {
+			self.take(until: token.deallocSignal)
+				.start { event in
+					let originalState = state.modify { state in
+						if let value = event.value {
+							state.add(value)
+						} else {
+							// Disconnect all observers and prevent future
+							// attachments.
+							state.terminationEvent = event
+							state.observers = nil
+						}
+					}
+
+					originalState.observers?.forEach { $0.action(event) }
+				}
+		}
+
+		return SignalProducer { observer, disposable in
+			// Don't dispose of the original producer until all observers
+			// have terminated.
+			disposable += { _ = token }
+
 			var token: RemovalToken?
 
 			let replayBuffer = ReplayBuffer<Value>()
@@ -1679,46 +1703,16 @@ extension SignalProducerProtocol {
 
 			if let terminationEvent = next.terminationEvent {
 				observer.action(terminationEvent)
-			}
-
-			if let token = token {
+			} else if let token = token {
 				disposable += {
 					state.modify { state in
 						state.observers?.remove(using: token)
 					}
 				}
+
+				// Start the underlying producer if it has never been started.
+				bootstrap.dispose()
 			}
-		}
-
-		let bootstrap = ActionDisposable {
-			// Start the underlying producer.
-			self.take(until: token.deallocSignal)
-				.start { event in
-					let originalState = state.modify { state in
-						if let value = event.value {
-							state.add(value)
-						} else {
-							// Disconnect all observers and prevent future
-							// attachments.
-							state.terminationEvent = event
-							state.observers = nil
-						}
-					}
-
-					originalState.observers?.forEach { $0.action(event) }
-				}
-		}
-
-		return SignalProducer { observer, disposable in
-			// subscribe `observer` before starting the underlying producer.
-			disposable += multicaster.start(observer)
-
-			// Don't dispose of the original producer until all observers
-			// have terminated.
-			disposable += { _ = token }
-
-			// Start the underlying producer if it has never been started.
-			bootstrap.dispose()
 		}
 	}
 }
